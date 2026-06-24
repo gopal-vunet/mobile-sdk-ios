@@ -1,1 +1,45 @@
-# mobile-sdk-ios
+# vuTelemetry v0.0.1 — pre-built XCFrameworks
+
+Self-contained **dynamic** XCFrameworks for iOS (device + simulator):
+
+- `vuTelemetry.xcframework`
+- `vuTelemetrySDWebImage.xcframework`
+
+## Compiler compatibility
+
+Built **with** library evolution, so the frameworks ship a stable `.swiftinterface`
+and are **portable across Xcode versions** — consumable by any Xcode at or newer
+than the build toolchain (Xcode 26.5). No per-Xcode rebuild
+needed.
+
+## Integration
+
+Add as a remote Swift package (Xcode ▸ File ▸ Add Package Dependencies, or in a
+`Package.swift`):
+
+```swift
+.package(url: "https://github.com/gopal-vunet/mobile-sdk-ios.git", from: "0.0.1")
+```
+
+then add the `vuTelemetry` product. SwiftPM fetches the prebuilt
+`.xcframework.zip` from this version's GitHub Release. The wrapper bundles the
+SDK's internal bootstrap sources and pins the external dependencies
+(OpenTelemetry, PLCrashReporter) at the exact versions the binary was compiled
+against — you do not add those yourself.
+
+For SDWebImage image-load instrumentation, also add `vuTelemetrySDWebImage` and
+set `OTHER_LDFLAGS = -ObjC` on your app target (its hooks auto-install via an
+ObjC `+load` that is otherwise dead-stripped).
+
+## Caveat: don't import OpenTelemetry directly
+
+Each framework embeds its own copy of OpenTelemetry. If your **app** also imports
+OpenTelemetry directly, you'll get a second copy with separate global state.
+Drive telemetry through vuTelemetry's API instead.
+
+## Slices
+
+| Slice | Architectures |
+|-------|---------------|
+| iOS Device | arm64 |
+| iOS Simulator | arm64, x86_64 |
