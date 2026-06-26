@@ -33,26 +33,28 @@ extern void vu_set_scene_connection_end_ns(uint64_t ns);
 typedef BOOL (*AppDelegateMethodIMP)(id, SEL, UIApplication *, NSDictionary *);
 typedef void (*SceneDelegateMethodIMP)(id, SEL, UIScene *, UISceneSession *, UISceneConnectionOptions *);
 
-// Finding #9: Per-class storage for AppDelegate original IMPs (instead of single globals)
+// Finding #9: Per-class storage for AppDelegate original IMPs (install phase only).
+// These dictionaries are used at swizzle-install time to store the captured IMP per class.
+// The hot-path wrappers below do NOT access these dictionaries — they use the cached
+// static IMP pointers below instead, which avoids @synchronized overhead on the
+// critical path of willFinishLaunching / didFinishLaunching / sceneWillConnect.
 static NSMutableDictionary<NSString *, NSValue *> *willFinishOriginalIMPs = nil;
 static NSMutableDictionary<NSString *, NSValue *> *didFinishOriginalIMPs = nil;
 
-// Finding #26: Per-class storage for scene delegate original implementations (synchronized access)
+// Finding #26: Per-class storage for scene delegate original implementations (install phase only).
 static NSMutableDictionary<NSString *, NSValue *> *sceneOriginalIMPs = nil;
+
+// Cached IMP pointers for hot-path wrappers.
+// Written once at install time (on the main thread, before any lifecycle method fires).
+// Read from the wrapper functions which also run on the main thread — no lock needed.
+static AppDelegateMethodIMP vu_cached_willFinish_IMP = NULL;
+static AppDelegateMethodIMP vu_cached_didFinish_IMP = NULL;
+static SceneDelegateMethodIMP vu_cached_sceneWillConnect_IMP = NULL;
 
 // Finding #10: Plain C wrapper functions with correct IMP signature
 static BOOL vu_willFinishLaunching_wrapper(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
     vu_set_will_finish_launching_begin_ns(mach_absolute_time());
-
-    NSString *className = [NSString stringWithUTF8String:class_getName([self class])];
-    AppDelegateMethodIMP originalIMP = NULL;
-    @synchronized(willFinishOriginalIMPs) {
-        NSValue *impValue = willFinishOriginalIMPs[className];
-        if (impValue) originalIMP = (AppDelegateMethodIMP)[impValue pointerValue];
-    }
-
-    BOOL result = originalIMP ? originalIMP(self, _cmd, app, opts) : YES;
-
+    BOOL result = vu_cached_willFinish_IMP ? vu_cached_willFinish_IMP(self, _cmd, app, opts) : YES;
     vu_set_will_finish_launching_end_ns(mach_absolute_time());
 #if DEBUG
     VU_LOG("[VULifecycleSwizzler] willFinish captured begin=%llu end=%llu\n",
@@ -63,18 +65,8 @@ static BOOL vu_willFinishLaunching_wrapper(id self, SEL _cmd, UIApplication *app
 
 static BOOL vu_didFinishLaunching_wrapper(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
     VU_LOG("[VULifecycleSwizzler] didFinish ENTERED\n");
-
     vu_set_did_finish_launching_begin_ns(mach_absolute_time());
-
-    NSString *className = [NSString stringWithUTF8String:class_getName([self class])];
-    AppDelegateMethodIMP originalIMP = NULL;
-    @synchronized(didFinishOriginalIMPs) {
-        NSValue *impValue = didFinishOriginalIMPs[className];
-        if (impValue) originalIMP = (AppDelegateMethodIMP)[impValue pointerValue];
-    }
-
-    BOOL result = originalIMP ? originalIMP(self, _cmd, app, opts) : YES;
-
+    BOOL result = vu_cached_didFinish_IMP ? vu_cached_didFinish_IMP(self, _cmd, app, opts) : YES;
     vu_set_did_finish_launching_end_ns(mach_absolute_time());
 #if DEBUG
     VU_LOG("[VULifecycleSwizzler] didFinish captured begin=%llu end=%llu\n",
@@ -87,13 +79,7 @@ static BOOL vu_didFinishLaunching_wrapper(id self, SEL _cmd, UIApplication *app,
 static void vu_sceneWillConnect_wrapper(id self, SEL _cmd, UIScene *scene,
                                          UISceneSession *session,
                                          UISceneConnectionOptions *connectionOptions) {
-    NSString *className = [NSString stringWithUTF8String:class_getName([self class])];
-    SceneDelegateMethodIMP originalIMP = NULL;
-    // Finding #26: Synchronized access to sceneOriginalIMPs
-    @synchronized(sceneOriginalIMPs) {
-        NSValue *impValue = sceneOriginalIMPs[className];
-        if (impValue) originalIMP = (SceneDelegateMethodIMP)[impValue pointerValue];
-    }
+    SceneDelegateMethodIMP originalIMP = vu_cached_sceneWillConnect_IMP;
 
     if (vu_get_scene_connection_begin_ns() == 0) {
         vu_set_scene_connection_begin_ns(mach_absolute_time());
@@ -112,50 +98,62 @@ static void vu_sceneWillConnect_wrapper(id self, SEL _cmd, UIScene *scene,
 
 @implementation VULifecycleSwizzler
 
-// Finding #25: Install scene swizzle on a specific class rather than scanning all ObjC classes
-+ (void)installSceneSwizzlesOnAllSceneDelegates {
+// Observer token for the one-shot UISceneWillConnectNotification handler.
+// Held so the block can remove itself after the scene delegate class is known.
+static id _sceneWillConnectObserverToken = nil;
+
+// Deferred-install replacement for the previous full-process objc_getClassList scan.
+//
+// Cold-start cost of the old approach: ~240ms on the synchronous setDelegate: path
+// (Time Profiler showed objc_getClassList → realizeAllClasses → realizeClassWithoutSwift
+// dominating _UIApplicationMainPreparations). The scan was needed only because at
+// setDelegate: time we don't yet know the scene delegate class — scene delegates are
+// instantiated later by UIApplication from UISceneConfiguration.
+//
+// Instead, register a one-shot observer for UISceneWillConnectNotification. When the
+// first scene connects, notification.object is the UIScene; its .delegate gives us the
+// concrete scene delegate class, which we then swizzle for any subsequent scene
+// connections in the same process. No process-wide class realization required.
+//
+// First-scene timing fallback: UISceneWillConnectNotification posts synchronously
+// alongside the scene:willConnectToSession:options: call. If the swizzle is too late
+// to intercept the first call, scene_connection_begin/end_ns is captured from the
+// notification handler itself so the app.start lifecycle event is not lost.
++ (void)installSceneSwizzleObserver {
     if (@available(iOS 13.0, *)) {
-        Protocol *sceneDelegateProtocol = @protocol(UIWindowSceneDelegate);
-        int classCount = objc_getClassList(NULL, 0);
-        if (classCount <= 0) {
-            VU_LOG("[VULifecycleSwizzler] installSceneSwizzles: no classes found\n");
-            return;
-        }
-
-        Class *classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * (size_t)classCount);
-        if (classes == NULL) {
-            return;
-        }
-
-        int swizzledCount = 0;
-        classCount = objc_getClassList(classes, classCount);
-        for (int i = 0; i < classCount; i++) {
-            Class cls = classes[i];
-            if (cls != Nil && class_conformsToProtocol(cls, sceneDelegateProtocol)) {
-                VU_LOG("[VULifecycleSwizzler] Found scene delegate class: %s\n", class_getName(cls));
-                [self installSceneConnectionOn:cls];
-                swizzledCount++;
-            }
-        }
-
-        if (swizzledCount == 0) {
-            VU_LOG("[VULifecycleSwizzler] No explicit UIWindowSceneDelegate conformers found, checking common names...\n");
-            NSArray *commonNames = @[@"SceneDelegate", @"UIWindowSceneDelegate"];
-            for (NSString *className in commonNames) {
-                Class cls = NSClassFromString(className);
-                if (cls != Nil) {
-                    VU_LOG("[VULifecycleSwizzler] Found by name: %s\n", class_getName(cls));
-                    [self installSceneConnectionOn:cls];
-                    swizzledCount++;
+        static dispatch_once_t observerOnceToken;
+        dispatch_once(&observerOnceToken, ^{
+            _sceneWillConnectObserverToken =
+                [[NSNotificationCenter defaultCenter] addObserverForName:UISceneWillConnectNotification
+                                                                  object:nil
+                                                                   queue:nil
+                                                              usingBlock:^(NSNotification * _Nonnull note) {
+                UIScene *scene = (UIScene *)note.object;
+                id sceneDelegate = scene.delegate;
+                if (sceneDelegate) {
+                    Class sceneClass = [sceneDelegate class];
+                    VU_LOG("[VULifecycleSwizzler] Resolved scene delegate class via notification: %s\n",
+                           class_getName(sceneClass));
+                    [VULifecycleSwizzler installSceneConnectionOn:sceneClass];
                 }
-            }
-        }
 
-        if (swizzledCount > 0) {
-            VU_LOG("[VULifecycleSwizzler] Swizzled %d scene delegate class(es)\n", swizzledCount);
-        }
+                // Fallback timing: if the first scene:willConnect already ran before
+                // the swizzle was in place, record the notification moment so the
+                // scene.connected lifecycle event still fires.
+                if (vu_get_scene_connection_begin_ns() == 0) {
+                    uint64_t now = mach_absolute_time();
+                    vu_set_scene_connection_begin_ns(now);
+                    vu_set_scene_connection_end_ns(now);
+                    VU_LOG("[VULifecycleSwizzler] First-scene timing recorded from notification (swizzle too late)\n");
+                }
 
-        free(classes);
+                // One-shot: remove ourselves once the swizzle is in place.
+                if (_sceneWillConnectObserverToken) {
+                    [[NSNotificationCenter defaultCenter] removeObserver:_sceneWillConnectObserverToken];
+                    _sceneWillConnectObserverToken = nil;
+                }
+            }];
+        });
     }
 }
 
@@ -179,7 +177,7 @@ static void vu_sceneWillConnect_wrapper(id self, SEL _cmd, UIScene *scene,
 
     [self installWillFinishLaunchingOn:delegateClass];
     [self installDidFinishLaunchingOn:delegateClass];
-    [self installSceneSwizzlesOnAllSceneDelegates];
+    [self installSceneSwizzleObserver];
 
     VU_LOG("[VULifecycleSwizzler] Installed on %s\n", class_getName(delegateClass));
 }
@@ -200,6 +198,8 @@ static void vu_sceneWillConnect_wrapper(id self, SEL _cmd, UIScene *scene,
         @synchronized(willFinishOriginalIMPs) {
             willFinishOriginalIMPs[className] = [NSValue valueWithPointer:(const void *)origIMP];
         }
+        // Cache the IMP for direct use in the hot-path wrapper (avoids @synchronized at call time).
+        vu_cached_willFinish_IMP = origIMP;
 
         // Guard against superclass poisoning: if delegateClass doesn't directly
         // implement this method, class_getInstanceMethod returns the superclass Method.
@@ -234,6 +234,8 @@ static void vu_sceneWillConnect_wrapper(id self, SEL _cmd, UIScene *scene,
         @synchronized(didFinishOriginalIMPs) {
             didFinishOriginalIMPs[className] = [NSValue valueWithPointer:(const void *)origIMP];
         }
+        // Cache the IMP for direct use in the hot-path wrapper (avoids @synchronized at call time).
+        vu_cached_didFinish_IMP = origIMP;
 
         BOOL added = class_addMethod(delegateClass, originalSel,
                                      (IMP)vu_didFinishLaunching_wrapper,
@@ -264,10 +266,12 @@ static void vu_sceneWillConnect_wrapper(id self, SEL _cmd, UIScene *scene,
 
             SceneDelegateMethodIMP originalIMP = (SceneDelegateMethodIMP)method_getImplementation(origMethod);
             NSString *className = [NSString stringWithUTF8String:class_getName(delegateClass)];
-            // Finding #26: Synchronized access
+            // Finding #26: Synchronized access for install-phase dictionary.
             @synchronized(sceneOriginalIMPs) {
                 sceneOriginalIMPs[className] = [NSValue valueWithPointer:(const void *)originalIMP];
             }
+            // Cache the IMP for direct use in the hot-path wrapper (avoids @synchronized at call time).
+            vu_cached_sceneWillConnect_IMP = originalIMP;
             VU_LOG("[VULifecycleSwizzler] Saved original_sceneWillConnect IMP for %s: %p\n",
                     class_getName(delegateClass), originalIMP);
 

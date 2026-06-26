@@ -29,8 +29,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// Process start time — WALL-CLOCK Unix nanoseconds (from kernel sysctl)
 uint64_t vu_get_process_start_ns(void);
 
-/// End of dylib loading phase — MACH TICKS (not nanoseconds despite name)
-uint64_t vu_get_dylib_loaded_end_ns(void);
+/// End of dylib loading phase — MACH TICKS (raw mach_absolute_time)
+uint64_t vu_get_dylib_loaded_end_mach(void);
 
 /// Anchor pair captured atomically at Constructor(101)
 /// vu_get_wall_clock_at_process_start_ns: WALL-CLOCK Unix nanoseconds
@@ -78,6 +78,10 @@ void vu_set_main_entry_ns(uint64_t ticks);
 void vu_set_ui_application_delegate_assigned_ns(uint64_t ticks);
 
 // Called at app entry to mark the end of static initializers and detect prewarm.
+// NOTE: Only reachable via the fishhook vu_hooked_main wrapper. For SwiftUI @main apps
+// the Swift compiler generates a main() with no C linkage, so fishhook never fires and
+// this function is never called. The static_init_end fallback in refreshStaticInitAnchors
+// covers that path (using the setDelegate: hook timestamp as an approximation).
 void vu_capture_main_entry_and_prewarm(void);
 
 /// Unified helpers to eliminate redundancies

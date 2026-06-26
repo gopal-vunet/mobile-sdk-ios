@@ -10,16 +10,55 @@
 
 static BOOL vu_exportDebugLogsEnabled = NO;
 static dispatch_once_t initToken;
-static os_log_t legacyLog;
+static NSMutableDictionary<NSString *, os_log_t> *vu_loggers = nil;
+static NSLock *vu_loggerLock = nil;
 
 @implementation VUObjCLogger
 
++ (os_log_t)getLoggerForSubsystem:(NSString *)subsystem {
+    static dispatch_once_t loggerInitToken;
+    dispatch_once(&loggerInitToken, ^{
+        vu_loggers = [NSMutableDictionary dictionary];
+        vu_loggerLock = [[NSLock alloc] init];
+    });
+    
+    [vu_loggerLock lock];
+    os_log_t log = vu_loggers[subsystem];
+    if (!log) {
+        log = os_log_create([subsystem UTF8String], "VunetSDK");
+        vu_loggers[subsystem] = log;
+    }
+    [vu_loggerLock unlock];
+    return log;
+}
+
 + (void)initializeIfNeeded {
     dispatch_once(&initToken, ^{
-        legacyLog = os_log_create("com.vunet.telemetry", "SDK");
         NSNumber *val = [[NSBundle mainBundle] infoDictionary][@"OtelExportDebugLogs"];
         if (val) {
             vu_exportDebugLogsEnabled = [val boolValue];
+        }
+        
+        os_log_t bootLog = [self getLoggerForSubsystem:@"com.vunet.telemetry.logger"];
+        NSString *timestamp = [self getISO8601Timestamp];
+        BOOL isDebug = NO;
+#ifdef DEBUG
+        isDebug = YES;
+#endif
+        NSString *environment = isDebug ? @"development" : @"production";
+        NSDictionary *payload = @{
+            @"level": @"debug",
+            @"timestamp": timestamp,
+            @"component": @"logger",
+            @"event": @"config_read",
+            @"sdk_version": @"0.0.1",
+            @"environment": environment,
+            @"message": [NSString stringWithFormat:@"Read OtelExportDebugLogs from Info.plist: %@", vu_exportDebugLogsEnabled ? @"YES" : @"NO"]
+        };
+        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:NSJSONWritingSortedKeys error:nil];
+        if (jsonData) {
+            NSString *jsonString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+            os_log_with_type(bootLog, OS_LOG_TYPE_DEBUG, "%{public}s", [jsonString UTF8String]);
         }
     });
 }
@@ -199,9 +238,17 @@ static os_log_t legacyLog;
     
     NSString *jsonString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
     
-#ifdef DEBUG
-    printf("%s\n", [jsonString UTF8String]);
-#else
+    NSString *resolvedSubsystem;
+    if ([[component lowercaseString] isEqualToString:@"vuplugin"]) {
+        resolvedSubsystem = @"com.vunet.telemetry.VuPlugin";
+    } else {
+        NSString *subComponent = [component lowercaseString];
+        subComponent = [subComponent stringByReplacingOccurrencesOfString:@"_" withString:@"."];
+        resolvedSubsystem = [NSString stringWithFormat:@"com.vunet.telemetry.%@", subComponent];
+    }
+    
+    os_log_t logObj = [self getLoggerForSubsystem:resolvedSubsystem];
+    
     os_log_type_t osLogLevel = OS_LOG_TYPE_DEFAULT;
     switch (level) {
         case VULogLevelDebug: osLogLevel = OS_LOG_TYPE_DEBUG; break;
@@ -209,8 +256,7 @@ static os_log_t legacyLog;
         case VULogLevelWarning: osLogLevel = OS_LOG_TYPE_DEFAULT; break;
         case VULogLevelError: osLogLevel = OS_LOG_TYPE_ERROR; break;
     }
-    os_log_with_type(legacyLog, osLogLevel, "%{public}s", [jsonString UTF8String]);
-#endif
+    os_log_with_type(logObj, osLogLevel, "%{public}s", [jsonString UTF8String]);
 }
 
 + (void)logWithFormat:(const char *)format, ... {

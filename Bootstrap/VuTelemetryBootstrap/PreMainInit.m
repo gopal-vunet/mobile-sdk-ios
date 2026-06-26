@@ -35,7 +35,7 @@
 // Swift accesses them only via vu_get_*() accessor functions.
 
 extern void vu_set_process_start_ns(uint64_t ns);
-extern void vu_set_dylib_loaded_end_ns(uint64_t ns);
+extern void vu_set_dylib_loaded_end_mach(uint64_t ticks);
 extern void vu_set_static_init_begin_ns(uint64_t ns);
 extern void vu_set_static_init_end_ns(uint64_t ns);
 extern uint64_t vu_get_static_init_end_ns(void);
@@ -62,6 +62,7 @@ static void vuOnImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide) 
 
     uint64_t current_ticks = mach_absolute_time();
 
+#if DEBUG
     if (vu_dylib_profiler_record_count() < VU_DYLIB_PROFILER_MAX_DYLIBS) {
         // Use _dyld_get_image_name instead of dladdr — dladdr acquires dyld's internal
         // locks and causes deadlocks + ~1-3ms overhead inside the add-image callback.
@@ -70,9 +71,10 @@ static void vuOnImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide) 
         if (!dylib_path) dylib_path = "<unknown>";
         vu_dylib_profiler_on_image_added(dylib_path, current_ticks);
     }
-    
+#endif
+
     if (!atomic_load(&vu_initial_dylib_scan_complete)) {
-        vu_set_dylib_loaded_end_ns(current_ticks);
+        vu_set_dylib_loaded_end_mach(current_ticks);
     }
     atomic_fetch_add(&vu_image_callback_count, 1);
 }
@@ -109,8 +111,10 @@ static void vu_custom_setDelegate(id self, SEL _cmd, id delegate) {
         uint64_t delegateAssignedNs = vu_mach_time_to_unix_nanos(delegateAssignedMach);
         vu_set_ui_application_delegate_assigned_ns(delegateAssignedMach);
         
+#if DEBUG
         // Mark end of dylib profiling phase
         vu_dylib_profiler_end_phase(delegateAssignedMach);
+#endif
 
         // Signal entry to main() phase
         ghost_crash_set_phase(GhostCrashPhaseMain);
@@ -124,10 +128,12 @@ static void vu_custom_setDelegate(id self, SEL _cmd, id delegate) {
         VU_LOG( "[vuTelemetry] ui_application_delegate_assigned captured: %llu (image_count=%u prewarmed=%d)\n",
                 delegateAssignedNs, vu_image_callback_count, [prewarmFlag isEqualToString:@"1"]);
         
+#if DEBUG
         // Dump dylib profiling report
         if ([VUObjCLogger exportDebugLogsEnabled]) {
             vu_dylib_profiler_report();
         }
+#endif
     }
     
     // Install lifecycle method swizzles on the concrete delegate class
@@ -201,14 +207,20 @@ static void vuInstallMainHook(void) {
 @implementation VUPreMainProbe
 
 + (void)load {
-    // Start dylib profiler early
+#if DEBUG
+    // Start dylib profiler early — debug only; skipped in release to avoid per-image overhead
     vu_dylib_profiler_start();
     VU_LOG( "[vuTelemetry] dylib profiler enabled\n");
-    
-    // Register dyld image callback
+#endif
+
+    // Register dyld image callback for timing anchors (always) and profiling (debug only).
+    // NOTE: _dyld_register_func_for_add_image backfills all already-loaded images synchronously,
+    // so the callback must be as lightweight as possible in release builds.
     _dyld_register_func_for_add_image(&vuOnImageAdded);
+#if DEBUG
     // Finding #12: Mark replay phase complete so post-registration callbacks are flagged correctly
     vu_dylib_profiler_mark_replay_complete();
+#endif
     atomic_store(&vu_initial_dylib_scan_complete, YES);
     VU_LOG( "[vuTelemetry] dyld image callback registered from +load\n");
 
@@ -242,13 +254,13 @@ static void vuCaptureProcessStart(void) {
     
     // Static init begin is this constructor boundary (start of static initializers phase).
     // Dylib loading end is captured separately via dyld image callbacks and should precede this.
-    uint64_t dylibLoadedEnd = vu_get_dylib_loaded_end_ns();
+    uint64_t dylibLoadedEnd = vu_get_dylib_loaded_end_mach();
     uint64_t staticInitBeginMach = machTimeAtProcessStart;
     vu_set_static_init_begin_ns(vu_mach_time_to_unix_nanos(staticInitBeginMach));
     
     // Fallback if dylib callbacks haven't fired (on simulator with cached dylibs)
     if (dylibLoadedEnd == 0) {
-        vu_set_dylib_loaded_end_ns(mach_absolute_time());
+        vu_set_dylib_loaded_end_mach(mach_absolute_time());
         VU_LOG( "[VuTelemetry] ⚠️ dylib_loaded_end fallback (cached images?) — callbacks: %u\n",
                 vu_image_callback_count);
     } else {
@@ -257,9 +269,9 @@ static void vuCaptureProcessStart(void) {
     }
 
     // Finding #17: Use constructor timestamp as the boundary instead of fabricating a -1 offset
-    uint64_t normalizedDylibEndMach = vu_get_dylib_loaded_end_ns();
+    uint64_t normalizedDylibEndMach = vu_get_dylib_loaded_end_mach();
     if (normalizedDylibEndMach >= staticInitBeginMach) {
-        vu_set_dylib_loaded_end_ns(staticInitBeginMach);
+        vu_set_dylib_loaded_end_mach(staticInitBeginMach);
         normalizedDylibEndMach = staticInitBeginMach;
         VU_LOG("[VuTelemetry] dylib_loaded_end clamped to static_init_begin (dyld and static init overlap)\n");
     }
@@ -311,7 +323,11 @@ static void vuMarkOtelSdkInitBegin(void) {
 
 // MARK: - UIApplicationMain Interception Helper
 
-// Finding #22: Guard against redundant execution when both code paths fire
+// Finding #22: Guard against redundant execution when both code paths fire.
+// NOTE: Only called from vu_hooked_main (fishhook). For SwiftUI @main apps the Swift
+// compiler generates main() without C linkage — fishhook never fires, so this function
+// is unreachable in SwiftUI apps. refreshStaticInitAnchors() falls back to
+// vu_ui_application_delegate_assigned_ns in that case (see StartupTelemetry.m).
 void vu_capture_main_entry_and_prewarm(void) {
     static BOOL already_called = NO;
     if (already_called) return;

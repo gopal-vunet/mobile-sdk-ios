@@ -1,4 +1,4 @@
-# vuTelemetry v0.0.1 — pre-built XCFrameworks
+# vuTelemetry v0.0.2 — pre-built XCFrameworks
 
 Self-contained **dynamic** XCFrameworks for iOS (device + simulator):
 
@@ -18,7 +18,7 @@ Add as a remote Swift package (Xcode ▸ File ▸ Add Package Dependencies, or i
 `Package.swift`):
 
 ```swift
-.package(url: "https://github.com/gopal-vunet/mobile-sdk-ios.git", from: "0.0.1")
+.package(url: "https://github.com/gopal-vunet/mobile-sdk-ios.git", from: "0.0.2")
 ```
 
 then add the `vuTelemetry` product. SwiftPM fetches the prebuilt

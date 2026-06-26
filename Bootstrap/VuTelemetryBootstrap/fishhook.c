@@ -2,7 +2,6 @@
 // Vendored from https://github.com/facebook/fishhook
 
 #include "fishhook.h"
-#include <dlfcn.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,8 +105,10 @@ symbol_loop:;
 static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
                                      const struct mach_header *header,
                                      intptr_t slide) {
-  Dl_info info;
-  if (dladdr(header, &info) == 0) {
+  // Validate header without calling dladdr, which acquires dyld's internal lock
+  // and causes __ulock_wait2 contention on the main thread during dynamic loads.
+  if (header == NULL ||
+      (header->magic != MH_MAGIC_64 && header->magic != MH_MAGIC)) {
     return;
   }
 

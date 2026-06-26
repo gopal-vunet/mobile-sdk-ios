@@ -28,8 +28,8 @@
 /// Process start time (wall-clock Unix nanoseconds from kernel sysctl)
 static uint64_t vu_process_start_ns = 0;
 
-/// End of dylib loading (mach_absolute_time ticks)
-static uint64_t vu_dylib_loaded_end_ns = 0;
+/// End of dylib loading (raw mach_absolute_time ticks — NOT nanoseconds)
+static uint64_t vu_dylib_loaded_end_mach = 0;
 
 /// Anchor pair captured atomically in Constructor(101)
 static uint64_t vu_wall_clock_at_process_start_ns = 0;
@@ -118,8 +118,8 @@ static uint64_t vu_scene_connection_end_ns = 0;
         self.processStartNs = vu_process_start_ns;
     }
 
-    if (vu_dylib_loaded_end_ns > 0) {
-        self.dylibLoadedEndMach = vu_dylib_loaded_end_ns;
+    if (vu_dylib_loaded_end_mach > 0) {
+        self.dylibLoadedEndMach = vu_dylib_loaded_end_mach;
     }
 
     // staticInitBeginNs is already in wall-clock nanoseconds from PreMainInit
@@ -150,7 +150,10 @@ static uint64_t vu_scene_connection_end_ns = 0;
     } else if (vu_static_init_end_ns > 0) {
         self.mainEntryNs = vu_static_init_end_ns;
     } else if (vu_ui_application_delegate_assigned_ns > 0) {
-        // Best available fallback for SwiftUI @main: setDelegate fires just after main() entry
+        // Fallback for SwiftUI @main: fishhook cannot intercept Swift's generated main()
+        // so vu_main_entry_ns is never set. setDelegate: fires inside UIApplicationMain
+        // after window/scene setup, so this OVERSTATES static_initializers duration for
+        // SwiftUI apps. It is the best approximation available without a @_silgen_name shim.
         self.mainEntryNs = vu_mach_time_to_unix_nanos(vu_ui_application_delegate_assigned_ns);
     }
 
@@ -319,8 +322,8 @@ uint64_t vu_get_process_start_ns(void) {
     return vu_process_start_ns;
 }
 
-uint64_t vu_get_dylib_loaded_end_ns(void) {
-    return vu_dylib_loaded_end_ns;
+uint64_t vu_get_dylib_loaded_end_mach(void) {
+    return vu_dylib_loaded_end_mach;
 }
 
 uint64_t vu_get_wall_clock_at_process_start_ns(void) {
@@ -373,8 +376,8 @@ void vu_set_process_start_ns(uint64_t ns) {
     vu_process_start_ns = ns;
 }
 
-void vu_set_dylib_loaded_end_ns(uint64_t ns) {
-    vu_dylib_loaded_end_ns = ns;
+void vu_set_dylib_loaded_end_mach(uint64_t ticks) {
+    vu_dylib_loaded_end_mach = ticks;
 }
 
 void vu_set_wall_clock_at_process_start_ns(uint64_t ns) {

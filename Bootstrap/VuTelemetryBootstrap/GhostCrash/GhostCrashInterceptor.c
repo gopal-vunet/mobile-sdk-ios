@@ -153,7 +153,7 @@ void ghost_crash_update_time_anchors(uint64_t baseMach, uint64_t baseWallNs) {
 
 // Prototypes for StartupTelemetry timing functions
 uint64_t vu_get_process_start_ns(void);
-uint64_t vu_get_dylib_loaded_end_ns(void);
+uint64_t vu_get_dylib_loaded_end_mach(void);
 uint64_t vu_get_static_init_begin_ns(void);
 uint64_t vu_get_static_init_end_ns(void);
 uint64_t vu_get_otel_sdk_init_begin_ns(void);
@@ -310,7 +310,7 @@ static void ghost_crash_signal_handler(int signum, siginfo_t *info, void *contex
     vu_build_json_field_int(json_buffer, &pos, "crash.pid", (int)getpid(), 0);
     // Finding #5: Use pre-cached conversion parameters
     vu_build_json_field_uint(json_buffer, &pos, "crash.process_start_time_ns", vu_get_process_start_ns(), 0);
-    vu_build_json_field_uint(json_buffer, &pos, "crash.dylib_loaded_end_ns", safe_ticks_to_nanos(vu_get_dylib_loaded_end_ns()), 0);
+    vu_build_json_field_uint(json_buffer, &pos, "crash.dylib_loaded_end_ns", safe_ticks_to_nanos(vu_get_dylib_loaded_end_mach()), 0);
     vu_build_json_field_uint(json_buffer, &pos, "crash.static_init_begin_ns", vu_get_static_init_begin_ns(), 0);
     vu_build_json_field_uint(json_buffer, &pos, "crash.static_init_end_ns", vu_get_static_init_end_ns(), 0);
     vu_build_json_field_uint(json_buffer, &pos, "crash.otel_sdk_init_begin_ns", safe_ticks_to_nanos(vu_get_otel_sdk_init_begin_ns()), 0);
