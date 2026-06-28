@@ -1,4 +1,4 @@
-# vuTelemetry v0.0.3 — pre-built XCFrameworks
+# vuTelemetry v0.0.4 — pre-built XCFrameworks
 
 Self-contained **dynamic** XCFrameworks for iOS (device + simulator):
 
@@ -18,7 +18,7 @@ Add as a remote Swift package (Xcode ▸ File ▸ Add Package Dependencies, or i
 `Package.swift`):
 
 ```swift
-.package(url: "https://github.com/gopal-vunet/mobile-sdk-ios.git", from: "0.0.3")
+.package(url: "https://github.com/gopal-vunet/mobile-sdk-ios.git", from: "0.0.4")
 ```
 
 then add the `vuTelemetry` product. SwiftPM fetches the prebuilt
@@ -29,6 +29,27 @@ dependencies yourself.
 For SDWebImage image-load instrumentation, also add `vuTelemetrySDWebImage` and
 set `OTHER_LDFLAGS = -ObjC` on your app target (its hooks auto-install via an
 ObjC `+load` that is otherwise dead-stripped).
+
+## SwiftUI instrumentation plugins
+
+The wrapper ships **source** build-tool and command plugins (SPM does not support
+binary plugin products):
+
+- `VUInstrumentationPlugin` — compile-time SwiftUI Button instrumentation for SPM targets
+- `VUInstrumentationCommand` — `swift package vu-instrument` for Xcode projects
+
+Both depend on a prebuilt `VUSourceInstrumenter` macOS tool (artifact bundle —
+consumers do **not** compile swift-syntax or XcodeProj). Add the plugin products
+to your app or package target in Xcode.
+
+For **Xcode .xcodeproj** projects, prefer the command plugin:
+
+```bash
+swift package --package-path /path/to/vuTelemetry vu-instrument install --project YourApp.xcodeproj
+```
+
+The prebuilt tool binary lives inside `VUSourceInstrumenter.artifactbundle` for
+run-script build phases that need direct access.
 
 ## Caveat: don't import OpenTelemetry directly
 
